@@ -1,0 +1,1 @@
+pub struct GPT2 {}
