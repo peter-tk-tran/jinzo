@@ -5,14 +5,14 @@ use core::ops::Sub;
 
 use candle_core::{Device, IndexOp, Result, Shape, Tensor};
 use candle_nn::ops::softmax;
-use candle_nn::{Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, Module};
+use candle_nn::{Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, Linear, Module};
 
 pub struct Attention {
     num_heads: usize,
     head_dim: usize,
     c_attn: Conv1d, // Concatenated attention
     c_proj: Conv1d, // Concatenated projection, instead of concating the results of each head, mix
-                    // them.
+    device: Device, // them.
 }
 impl Attention {
     fn new(num_heads: usize, embed_dim: usize, device: &Device) -> Result<Self> {
@@ -43,10 +43,12 @@ impl Attention {
             head_dim,
             c_attn,
             c_proj,
+            device: device.clone(),
         })
     }
-
-    fn forward(&self, hidden_state: &Tensor, device: &Device) -> Result<Tensor> {
+}
+impl Module for Attention {
+    fn forward(&self, hidden_state: &Tensor) -> Result<Tensor> {
         let (batch_size, num_tokens, embed_dim) = hidden_state.dims3()?;
         // let hidden_state = hidden_state.transpose(1, 2)?;
         let kqv = self.c_attn.forward(&hidden_state.transpose(1, 2)?)?;
@@ -68,8 +70,8 @@ impl Attention {
         let k = k.permute((0, 2, 1, 3))?;
         let v = v.permute((0, 2, 1, 3))?;
 
-        let inf = Tensor::full(f32::MAX, (num_tokens, num_tokens), device)?;
-        let tril = Tensor::tril2(num_tokens, candle_core::DType::F32, device)?.sub(1.0)?;
+        let inf = Tensor::full(f32::MAX, (num_tokens, num_tokens), &self.device)?;
+        let tril = Tensor::tril2(num_tokens, candle_core::DType::F32, &self.device)?.sub(1.0)?;
         let causal_mask = inf.broadcast_mul(&tril)?;
 
         let weights = q.matmul(&k.transpose(2, 3)?)?;
@@ -128,7 +130,9 @@ impl GPT2MLP {
             c_dropout,
         })
     }
-    fn forward(&self, hidden_states: Tensor) -> Result<Tensor> {
+}
+impl Module for GPT2MLP {
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let hidden_states = self.c_fc.forward(&hidden_states.transpose(1, 2)?)?;
         let hidden_states = hidden_states.transpose(1, 2)?;
         let hidden_states = self.c_act.forward(&hidden_states)?;
@@ -169,19 +173,22 @@ impl GPT2Block {
             mlp,
         })
     }
-    fn forward(&self, hidden_states: &Tensor, device: &Device) -> Result<Tensor> {
+}
+
+impl Module for GPT2Block {
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let residual = hidden_states.clone();
 
         let hidden_states = self.ln_1.forward(hidden_states)?;
 
-        let attn = self.attn.forward(&hidden_states, device)?;
+        let attn = self.attn.forward(&hidden_states)?;
 
         let hidden_states = residual.add(&attn)?;
 
         let residual = hidden_states.clone();
         let hidden_states = self.ln_2.forward(&hidden_states)?;
 
-        let ff_hidden_states = self.mlp.forward(hidden_states)?;
+        let ff_hidden_states = self.mlp.forward(&hidden_states)?;
         let hidden_states = residual.add(&ff_hidden_states)?;
 
         Ok(hidden_states)
@@ -194,6 +201,7 @@ pub struct GPT2Model {
     drop: Dropout,
     h: Vec<GPT2Block>,
     ln_f: LayerNorm,
+    lm_head: Linear,
 }
 
 impl GPT2Model {
@@ -216,12 +224,8 @@ impl GPT2Model {
             h.push(GPT2Block::new(embed_dim, device)?);
         }
 
-        // the output of wpe or wte tensor is this:
-        // batch, seq_len, embed_dim
-        // we want to perform layer norm
-        // which applies some sort of normalization on the channels layer
-        // # batch size and seq length are variable, leaving only the embed dim. this is the only
-        // thing we can set
+        let lm_head_tensor = Tensor::rand(0f32, 1.0, (vocab_size, embed_dim), device)?;
+        let lm_head = Linear::new(lm_head_tensor, None);
 
         Ok(GPT2Model {
             wte,
@@ -229,9 +233,10 @@ impl GPT2Model {
             drop,
             h,
             ln_f,
+            lm_head,
         })
     }
-    fn forward(&self, token_ids: &Tensor, device: &Device) -> Result<Tensor> {
+    fn forward(&self, token_ids: &Tensor) -> Result<Tensor> {
         let input_emb = self.wte.forward(token_ids)?;
         let position_emb = self.wpe.forward(token_ids)?;
 
@@ -239,10 +244,12 @@ impl GPT2Model {
 
         hidden_states = self.drop.forward(&hidden_states, true)?;
         for block in self.h.iter() {
-            hidden_states = block.forward(&hidden_states, device)?;
+            hidden_states = block.forward(&hidden_states)?;
         }
         hidden_states = self.ln_f.forward(&hidden_states)?;
-        Ok(hidden_states)
+
+        let token_logits = self.lm_head.forward(&hidden_states)?;
+        Ok(token_logits)
     }
 }
 
@@ -250,10 +257,10 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
     let model = GPT2Model::new(50275, 768, 0.2, &device)?;
 
-    let token_ids: Vec<u32> = vec![0, 12, 30, 10];
-    let token_ids = Tensor::from_vec(token_ids, (1, 4), &device)?;
+    let token_ids: Vec<u32> = vec![0, 12, 30];
+    let token_ids = Tensor::from_vec(token_ids, (1, 3), &device)?;
 
-    let pred = model.forward(&token_ids, &device)?;
+    let pred = model.forward(&token_ids)?;
     println!("{:?}", pred.shape());
     Ok(())
 }
