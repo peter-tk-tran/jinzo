@@ -7,3 +7,4 @@ edition = "2021"
 candle-core = "0.6.0"
 candle-nn = "0.6.0"
 dioxus = "0.5.6"
+tokenizers = { version = "0.20.0", features = ["http"] }

@@ -1,39 +1,29 @@
 use core::f32;
 use core::ops::Sub;
 
-use candle_core::{Device, IndexOp, Result, Shape, Tensor};
+use candle_core::{IndexOp, Result, Shape, Tensor};
 use candle_nn::ops::softmax;
-use candle_nn::{Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, Linear, Module};
+use candle_nn::{
+    Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, LayerNormConfig, Linear,
+    Module, VarBuilder,
+};
 
 pub struct Attention {
     num_heads: usize,
     head_dim: usize,
     c_attn: Conv1d, // Concatenated attention
     c_proj: Conv1d, // Concatenated projection, instead of concating the results of each head, mix
-    device: Device, // them.
 }
 impl Attention {
-    fn new(num_heads: usize, embed_dim: usize, device: &Device) -> Result<Self> {
-        // let (c_out, c_in_k, k_size) = kernel.dims3()?;
-        let c_attn_weight = Tensor::rand(0f32, 1.0, (embed_dim * 3, embed_dim, 1), device)?;
-        let c_attn_bias = Tensor::rand(0f32, 1.0, (embed_dim * 3,), device)?;
-        let c_attn_config = Conv1dConfig {
+    fn new(num_heads: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let conv_config = Conv1dConfig {
             padding: 0,
             stride: 1,
             dilation: 1,
             groups: 1,
         };
-        let c_attn = Conv1d::new(c_attn_weight, Some(c_attn_bias), c_attn_config);
-
-        let c_proj_weight = Tensor::rand(0f32, 1.0, (embed_dim, embed_dim, 1), device)?;
-        let c_proj_bias = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let c_proj_config = Conv1dConfig {
-            padding: 0,
-            stride: 1,
-            dilation: 1,
-            groups: 1,
-        };
-        let c_proj = Conv1d::new(c_proj_weight, Some(c_proj_bias), c_proj_config);
+        let c_attn = candle_nn::conv1d(embed_dim, embed_dim * 3, 1, conv_config, vb.pp("c_attn"))?;
+        let c_proj = candle_nn::conv1d(embed_dim, embed_dim, 1, conv_config, vb.pp("c_proj"))?;
 
         let head_dim = embed_dim / num_heads;
         Ok(Self {
@@ -41,7 +31,6 @@ impl Attention {
             head_dim,
             c_attn,
             c_proj,
-            device: device.clone(),
         })
     }
 }
@@ -68,8 +57,10 @@ impl Module for Attention {
         let k = k.permute((0, 2, 1, 3))?;
         let v = v.permute((0, 2, 1, 3))?;
 
-        let inf = Tensor::full(f32::MAX, (num_tokens, num_tokens), &self.device)?;
-        let tril = Tensor::tril2(num_tokens, candle_core::DType::F32, &self.device)?.sub(1.0)?;
+        let device = kqv.device();
+
+        let inf = Tensor::full(f32::MAX, (num_tokens, num_tokens), device)?;
+        let tril = Tensor::tril2(num_tokens, candle_core::DType::F32, device)?.sub(1.0)?;
         let causal_mask = inf.broadcast_mul(&tril)?;
 
         let weights = q.matmul(&k.transpose(2, 3)?)?;
@@ -91,37 +82,35 @@ impl Module for Attention {
 }
 
 pub struct GPT2MLP {
+    pub train: bool,
     c_fc: Conv1d,
     c_proj: Conv1d,
     c_act: Activation,
     c_dropout: Dropout,
 }
 impl GPT2MLP {
-    pub fn new(intermediate_size: usize, embed_dim: usize, device: &Device) -> Result<Self> {
-        let c_fc_weight = Tensor::rand(0f32, 1.0, (intermediate_size, embed_dim, 1), device)?;
-        let c_fc_bias = Tensor::rand(0f32, 1.0, (intermediate_size,), device)?;
-        let c_fc_config = Conv1dConfig {
+    pub fn new(intermediate_size: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let conv_config = Conv1dConfig {
             padding: 0,
             dilation: 1,
             groups: 1,
             stride: 1,
         };
-        let c_fc = Conv1d::new(c_fc_weight, Some(c_fc_bias), c_fc_config);
-
-        let c_proj_weight = Tensor::rand(0f32, 1.0, (embed_dim, intermediate_size, 1), device)?;
-        let c_proj_bias = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let c_proj_config = Conv1dConfig {
-            padding: 0,
-            dilation: 1,
-            groups: 1,
-            stride: 1,
-        };
-        let c_proj = Conv1d::new(c_proj_weight, Some(c_proj_bias), c_proj_config);
+        let c_fc = candle_nn::conv1d(embed_dim, intermediate_size, 1, conv_config, vb.pp("c_fc"))?;
+        let c_proj = candle_nn::conv1d(
+            intermediate_size,
+            embed_dim,
+            1,
+            conv_config,
+            vb.pp("c_proj"),
+        )?;
 
         let c_act = Activation::Gelu;
         let c_dropout = Dropout::new(0.2);
+        let train = false;
 
         Ok(GPT2MLP {
+            train,
             c_fc,
             c_proj,
             c_act,
@@ -136,7 +125,7 @@ impl Module for GPT2MLP {
         let hidden_states = self.c_act.forward(&hidden_states)?;
         let hidden_states = self.c_proj.forward(&hidden_states.transpose(1, 2)?)?;
         let hidden_states = hidden_states.transpose(1, 2)?;
-        let hidden_states = self.c_dropout.forward(&hidden_states, true)?; // SET TRAIN TO FALSE
+        let hidden_states = self.c_dropout.forward(&hidden_states, self.train)?;
         Ok(hidden_states)
     }
 }
@@ -148,21 +137,20 @@ pub struct GPT2Block {
     mlp: GPT2MLP,
 }
 impl GPT2Block {
-    fn new(embed_dim: usize, device: &Device) -> Result<Self> {
-        let ln_1_tensor = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let ln_1_bias = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let ln_1_eps = 1e-05;
-        let ln_1 = LayerNorm::new(ln_1_tensor, ln_1_bias, ln_1_eps);
+    fn new(embed_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let ln_c = LayerNormConfig {
+            eps: 1e-05,
+            remove_mean: true,
+            affine: true,
+        };
+        let ln_1 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("layer_norm_1"))?;
 
         let num_heads = 12;
-        let attn = Attention::new(num_heads, embed_dim, device)?;
+        let attn = Attention::new(num_heads, embed_dim, vb.pp("attn"))?;
 
-        let ln_2_tensor = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let ln_2_bias = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let ln_2_eps = 1e-05;
-        let ln_2 = LayerNorm::new(ln_2_tensor, ln_2_bias, ln_2_eps);
+        let ln_2 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("layer_norm_2"))?;
 
-        let mlp = GPT2MLP::new(4 * embed_dim, embed_dim, device)?;
+        let mlp = GPT2MLP::new(4 * embed_dim, embed_dim, vb.pp("mlp"))?;
 
         Ok(Self {
             ln_1,
@@ -194,6 +182,7 @@ impl Module for GPT2Block {
 }
 
 pub struct GPT2Model {
+    pub train: bool,
     pub wte: Embedding,
     pub wpe: Embedding,
     pub drop: Dropout,
@@ -203,29 +192,31 @@ pub struct GPT2Model {
 }
 
 impl GPT2Model {
-    pub fn new(vocab_size: usize, embed_dim: usize, drop_p: f32, device: &Device) -> Result<Self> {
-        let wte_tensor = Tensor::rand(0f32, 1.0, (vocab_size, embed_dim), device)?;
-        let wte = Embedding::new(wte_tensor, embed_dim);
-
-        let wpe_tensor = Tensor::rand(0f32, 1.0, (vocab_size, embed_dim), device)?;
-        let wpe = Embedding::new(wpe_tensor, embed_dim);
-
+    pub fn new(vocab_size: usize, embed_dim: usize, drop_p: f32, vb: VarBuilder) -> Result<Self> {
+        let wte = candle_nn::embedding(vocab_size, embed_dim, vb.pp("wte"))?;
+        let wpe = candle_nn::embedding(vocab_size, embed_dim, vb.pp("wpe"))?;
         let drop = Dropout::new(drop_p);
 
-        let ln_tensor = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let ln_bias = Tensor::rand(0f32, 1.0, (embed_dim,), device)?;
-        let eps = 1e-05;
-        let ln_f = LayerNorm::new(ln_tensor, ln_bias, eps);
+        let ln_config = LayerNormConfig {
+            eps: 1e-05,
+            remove_mean: true,
+            affine: true,
+        };
+        let ln_f = candle_nn::layer_norm(embed_dim, ln_config, vb.pp("layer_norm_f"))?;
 
         let mut h: Vec<GPT2Block> = Vec::new();
-        for _ in 0..12 {
-            h.push(GPT2Block::new(embed_dim, device)?);
+        for block_num in 0..12 {
+            h.push(GPT2Block::new(
+                embed_dim,
+                vb.pp(format!("block_{block_num}")),
+            )?);
         }
 
-        let lm_head_tensor = Tensor::rand(0f32, 1.0, (vocab_size, embed_dim), device)?;
-        let lm_head = Linear::new(lm_head_tensor, None);
+        let lm_head = candle_nn::linear(embed_dim, vocab_size, vb.pp("lm_head"))?;
+        let train = false;
 
         Ok(GPT2Model {
+            train,
             wte,
             wpe,
             drop,
@@ -240,7 +231,7 @@ impl GPT2Model {
 
         let mut hidden_states = input_emb.add(&position_emb)?;
 
-        hidden_states = self.drop.forward(&hidden_states, true)?;
+        hidden_states = self.drop.forward(&hidden_states, self.train)?;
         for block in self.h.iter() {
             hidden_states = block.forward(&hidden_states)?;
         }
