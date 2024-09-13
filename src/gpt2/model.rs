@@ -1,8 +1,8 @@
 use core::f32;
-use core::ops::Sub;
+use core::ops::{Div, Sub};
 
 use candle_core::{IndexOp, Result, Shape, Tensor};
-use candle_nn::ops::softmax;
+use candle_nn::ops::softmax_last_dim;
 use candle_nn::{
     Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, LayerNormConfig, Linear,
     Module, VarBuilder,
@@ -18,9 +18,9 @@ impl Attention {
     fn new(num_heads: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
         let conv_config = Conv1dConfig {
             padding: 0,
-            stride: 1,
-            dilation: 1,
+            dilation: 0,
             groups: 1,
+            stride: 1,
         };
         let c_attn = candle_nn::conv1d(embed_dim, embed_dim * 3, 1, conv_config, vb.pp("c_attn"))?;
         let c_proj = candle_nn::conv1d(embed_dim, embed_dim, 1, conv_config, vb.pp("c_proj"))?;
@@ -38,45 +38,48 @@ impl Module for Attention {
     fn forward(&self, hidden_state: &Tensor) -> Result<Tensor> {
         let (batch_size, num_tokens, embed_dim) = hidden_state.dims3()?;
         // let hidden_state = hidden_state.transpose(1, 2)?;
-        let kqv = self.c_attn.forward(&hidden_state.transpose(1, 2)?)?;
-        let kqv = kqv.transpose(1, 2)?; // Shape: B, T, embed_dim * 3
-        let kqv = kqv.reshape((batch_size, num_tokens, 3, embed_dim))?;
+        let mut kqv = self.c_attn.forward(&hidden_state.transpose(1, 2)?)?;
+        kqv = kqv.transpose(1, 2)?; // Shape: B, T, embed_dim * 3
+        kqv = kqv.reshape((batch_size, num_tokens, 3, embed_dim))?;
 
-        let q = kqv.i((.., .., 0, ..))?; // batch_size, num_tokens, embed_dim
-        let k = kqv.i((.., .., 1, ..))?;
-        let v = kqv.i((.., .., 2, ..))?;
+        let mut q = kqv.i((.., .., 0, ..))?; // batch_size, num_tokens, embed_dim
+        let mut k = kqv.i((.., .., 1, ..))?;
+        let mut v = kqv.i((.., .., 2, ..))?;
 
-        let org_shape = q.shape();
+        let org_shape = q.shape().clone();
         let new_shape = Shape::from_dims(&[batch_size, num_tokens, self.num_heads, self.head_dim]);
 
-        let q = q.reshape(&new_shape)?;
-        let k = k.reshape(&new_shape)?;
-        let v = v.reshape(&new_shape)?;
+        q = q.reshape(&new_shape)?;
+        k = k.reshape(&new_shape)?;
+        v = v.reshape(&new_shape)?;
 
-        let q = q.permute((0, 2, 1, 3))?; // b, heads, seq_length, head_features
-        let k = k.permute((0, 2, 1, 3))?;
-        let v = v.permute((0, 2, 1, 3))?;
+        q = q.permute((0, 2, 1, 3))?.contiguous()?; // b, heads, seq_length, head_features
+        k = k.permute((0, 2, 1, 3))?.contiguous()?;
+        v = v.permute((0, 2, 1, 3))?.contiguous()?;
 
         let device = kqv.device();
 
-        let inf = Tensor::full(f32::MAX, (num_tokens, num_tokens), device)?;
-        let tril = Tensor::tril2(num_tokens, candle_core::DType::F32, device)?.sub(1.0)?;
-        let causal_mask = inf.broadcast_mul(&tril)?;
+        // Create the lower triangular mask using `tril2`
+        let mut causal_mask = Tensor::tril2(num_tokens, candle_core::DType::F32, device)?; // Shape: (seq_len, seq_len)
+        let mask_value = 1e9;
+        causal_mask = (causal_mask.sub(1.0)? * mask_value)?; // Converts ones to zeros and zeros to `-1e9`
+                                                             // println!("Causal Mask is {causal_mask}");
 
-        let weights = q.matmul(&k.transpose(2, 3)?)?;
-        let weights = weights.broadcast_add(&causal_mask)?; // do not let previous tokens see the future
+        // lhs 8, 12, 4, 64
+        let mut weights = q.matmul(&k.transpose(2, 3)?)?;
+        weights = weights.div((self.head_dim as f64).sqrt())?;
+        weights = weights.broadcast_add(&causal_mask)?; // do not let previous tokens see the future
+        weights = softmax_last_dim(&weights)?;
 
-        let weights = softmax(&weights, 3)?; // weight shape (B, heads, seq_length, seq_length)
+        let dropout = Dropout::new(0.2);
+        weights = dropout.forward(&weights, true)?;
 
-        // println!("{v}"); // 1, 12, 4, 64
-        // println!("{weights}");
+        // println!("Weights {weights}"); // Thsese look good!
         // TODO add dropout to the weights!
-        let attn = weights.matmul(&v)?; // (B, heads, seq_length, head_features)
-                                        //
-        let attn = attn.reshape(org_shape)?;
-        let attn = self.c_proj.forward(&attn.transpose(1, 2)?)?;
-        let attn = attn.transpose(1, 2)?;
-        // TODO add drop out after the forward as well!
+        let mut attn = weights.matmul(&v)?; // (B, heads, seq_length, head_features)
+        attn = attn.reshape(org_shape)?;
+        attn = self.c_proj.forward(&attn.transpose(1, 2)?)?;
+        attn = attn.transpose(1, 2)?;
         Ok(attn)
     }
 }
@@ -92,7 +95,7 @@ impl GPT2MLP {
     pub fn new(intermediate_size: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
         let conv_config = Conv1dConfig {
             padding: 0,
-            dilation: 1,
+            dilation: 0,
             groups: 1,
             stride: 1,
         };
@@ -107,7 +110,7 @@ impl GPT2MLP {
 
         let c_act = Activation::Gelu;
         let c_dropout = Dropout::new(0.2);
-        let train = false;
+        let train = true;
 
         Ok(GPT2MLP {
             train,
@@ -120,12 +123,12 @@ impl GPT2MLP {
 }
 impl Module for GPT2MLP {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let hidden_states = self.c_fc.forward(&hidden_states.transpose(1, 2)?)?;
-        let hidden_states = hidden_states.transpose(1, 2)?;
-        let hidden_states = self.c_act.forward(&hidden_states)?;
-        let hidden_states = self.c_proj.forward(&hidden_states.transpose(1, 2)?)?;
-        let hidden_states = hidden_states.transpose(1, 2)?;
-        let hidden_states = self.c_dropout.forward(&hidden_states, self.train)?;
+        let mut hidden_states = self.c_fc.forward(&hidden_states.transpose(1, 2)?)?;
+        hidden_states = hidden_states.transpose(1, 2)?;
+        hidden_states = self.c_act.forward(&hidden_states)?;
+        hidden_states = self.c_proj.forward(&hidden_states.transpose(1, 2)?)?;
+        hidden_states = hidden_states.transpose(1, 2)?;
+        hidden_states = self.c_dropout.forward(&hidden_states, self.train)?;
         Ok(hidden_states)
     }
 }
@@ -133,6 +136,7 @@ impl Module for GPT2MLP {
 pub struct GPT2Block {
     ln_1: LayerNorm,
     attn: Attention,
+    drop: Dropout,
     ln_2: LayerNorm,
     mlp: GPT2MLP,
 }
@@ -145,16 +149,19 @@ impl GPT2Block {
         };
         let ln_1 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("layer_norm_1"))?;
 
-        let num_heads = 12;
+        let num_heads = 4;
         let attn = Attention::new(num_heads, embed_dim, vb.pp("attn"))?;
 
         let ln_2 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("layer_norm_2"))?;
 
         let mlp = GPT2MLP::new(4 * embed_dim, embed_dim, vb.pp("mlp"))?;
 
+        let drop = Dropout::new(0.2);
+
         Ok(Self {
             ln_1,
             attn,
+            drop,
             ln_2,
             mlp,
         })
@@ -165,17 +172,18 @@ impl Module for GPT2Block {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let residual = hidden_states.clone();
 
-        let hidden_states = self.ln_1.forward(hidden_states)?;
+        let mut hidden_states = self.ln_1.forward(hidden_states)?;
 
         let attn = self.attn.forward(&hidden_states)?;
+        let attn = self.drop.forward(&attn, true)?; // Assuming `self.dropout` is defined
 
-        let hidden_states = residual.add(&attn)?;
+        hidden_states = residual.add(&attn)?;
 
         let residual = hidden_states.clone();
-        let hidden_states = self.ln_2.forward(&hidden_states)?;
+        hidden_states = self.ln_2.forward(&hidden_states)?;
 
         let ff_hidden_states = self.mlp.forward(&hidden_states)?;
-        let hidden_states = residual.add(&ff_hidden_states)?;
+        hidden_states = residual.add(&ff_hidden_states)?;
 
         Ok(hidden_states)
     }
@@ -192,9 +200,15 @@ pub struct GPT2Model {
 }
 
 impl GPT2Model {
-    pub fn new(vocab_size: usize, embed_dim: usize, drop_p: f32, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        vocab_size: usize,
+        context_length: usize,
+        embed_dim: usize,
+        drop_p: f32,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let wte = candle_nn::embedding(vocab_size, embed_dim, vb.pp("wte"))?;
-        let wpe = candle_nn::embedding(vocab_size, embed_dim, vb.pp("wpe"))?;
+        let wpe = candle_nn::embedding(context_length, embed_dim, vb.pp("wpe"))?;
         let drop = Dropout::new(drop_p);
 
         let ln_config = LayerNormConfig {
@@ -213,7 +227,7 @@ impl GPT2Model {
         }
 
         let lm_head = candle_nn::linear(embed_dim, vocab_size, vb.pp("lm_head"))?;
-        let train = false;
+        let train = true;
 
         Ok(GPT2Model {
             train,
@@ -227,17 +241,21 @@ impl GPT2Model {
     }
     pub fn forward(&self, token_ids: &Tensor) -> Result<Tensor> {
         let input_emb = self.wte.forward(token_ids)?;
-        let position_emb = self.wpe.forward(token_ids)?;
-
-        let mut hidden_states = input_emb.add(&position_emb)?;
+        let (_, seq_length) = token_ids.dims2()?;
+        let positions = Tensor::arange(0 as u32, seq_length as u32, token_ids.device())?;
+        let position_emb = self.wpe.forward(&positions)?;
+        let mut hidden_states = input_emb.broadcast_add(&position_emb)?;
 
         hidden_states = self.drop.forward(&hidden_states, self.train)?;
         for block in self.h.iter() {
             hidden_states = block.forward(&hidden_states)?;
         }
+        // println!("FInished processing blocks");
         hidden_states = self.ln_f.forward(&hidden_states)?;
 
+        // println!("FInished ln f");
         let token_logits = self.lm_head.forward(&hidden_states)?;
+        // println!("{token_logits}");
         Ok(token_logits)
     }
 }
