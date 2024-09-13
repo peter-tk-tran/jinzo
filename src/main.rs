@@ -1,40 +1,17 @@
 pub mod gpt2;
-use candle_nn::loss::cross_entropy;
+pub mod lr_scheduler;
 use rand::Rng;
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use candle_core::{Device, IndexOp, Result, Tensor};
-use candle_nn::{loss, AdamW, Optimizer, VarBuilder, VarMap};
+use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 use gpt2::model::GPT2Model;
 use tokenizers::tokenizer::Tokenizer;
-struct LRScheduler {
-    initial_lr: f64,
-    decay_rate: f64,
-    step: usize,
-}
 
-impl LRScheduler {
-    fn new(initial_lr: f64, decay_rate: f64) -> Self {
-        Self {
-            initial_lr,
-            decay_rate,
-            step: 0,
-        }
-    }
-
-    fn step(&mut self) -> f64 {
-        self.step += 1;
-        self.initial_lr * self.decay_rate.powf(self.step as f64)
-    }
-
-    fn apply(&mut self, optimizer: &mut AdamW) {
-        let new_lr = self.step();
-        optimizer.set_learning_rate(new_lr);
-    }
-}
+use self::lr_scheduler::WarmupLRScheduler;
 
 fn count_params(vm: &VarMap) {
     let mut num_params = 0;
@@ -103,7 +80,7 @@ fn main() -> Result<()> {
 
     let tokenizer = Tokenizer::from_pretrained("gpt2", None).unwrap();
     if !model.train {
-        let mut query = "When I".to_string();
+        let mut query = "Hello".to_string();
         for _ in 0..100 {
             let encoding: tokenizers::Encoding = tokenizer.encode(query.clone(), true).unwrap();
             let encoding_ids = encoding.get_ids().to_vec();
@@ -114,15 +91,16 @@ fn main() -> Result<()> {
             let next_token_id = next_token_logits.argmax(1)?;
             let next_token = tokenizer.decode(&next_token_id.to_vec1()?, true).unwrap();
             print!("{next_token}");
+            io::stdout().flush().expect("Failed to flush stdout");
             query.push_str(&next_token);
         }
     }
     if model.train {
         let batch_size = 8;
-        let mut learning_rate = 0.0003;
-        let decay_rate = 0.99;
+        let learning_rate = 0.001;
 
-        let mut lr_scheduler = LRScheduler::new(learning_rate, decay_rate); // initial_lr = 0.001, decay_rate = 0.99
+        // let mut lr_scheduler = LRScheduler::new(learning_rate, decay_rate); // initial_lr = 0.001, decay_rate = 0.99
+        let mut lr_scheduler = WarmupLRScheduler::new(0.001, 0.999, 10);
 
         let adamw_params = candle_nn::ParamsAdamW {
             lr: learning_rate,
@@ -136,7 +114,7 @@ fn main() -> Result<()> {
 
         passage_file.read_to_string(&mut passage).unwrap();
         // println!("{passage}");
-        for step in 0..100 {
+        for _step in 0..100 {
             let (inputs, labels) =
                 get_batch(&passage, batch_size, context_length, &tokenizer, &device)?;
 
