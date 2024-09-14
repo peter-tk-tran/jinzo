@@ -61,101 +61,108 @@ fn get_batch(
 }
 
 fn main() -> Result<()> {
-    let model_path = Path::new("my_model");
+    // let model_path = Path::new("my_model");
+    let model_path = Path::new("/Users/petertran/Desktop/model.safetensors");
     // let device = Device::Cpu;
     let device = Device::new_metal(0)?;
     let mut vm = VarMap::new();
 
     let vb = VarBuilder::from_varmap(&vm, candle_core::DType::F32, &device);
-    let context_length = 256;
+    let context_length = 1024;
     let vocab_size = 50257;
-    let embed_dim = 384;
+    let embed_dim = 768;
     let dropout_p = 0.2;
     let mut model = GPT2Model::new(vocab_size, context_length, embed_dim, dropout_p, vb)?;
     model.train = true;
+
+    let model_tensors = candle_core::safetensors::load(model_path, &device)?;
+    for (k, _v) in model_tensors.iter() {
+        println!("Key {k}");
+        // println!("Value {v}");
+    }
 
     if model_path.exists() {
         load_weights(&mut vm, &model_path);
     }
 
-    let tokenizer = Tokenizer::from_pretrained("gpt2", None).unwrap();
-    if !model.train {
-        let mut query = "Hello".to_string();
-        for _ in 0..100 {
-            let encoding: tokenizers::Encoding = tokenizer.encode(query.clone(), true).unwrap();
-            let encoding_ids = encoding.get_ids().to_vec();
-            let token_ids = Tensor::from_vec(encoding_ids, (1, encoding.len()), &device)?;
-            let pred = model.forward(&token_ids)?;
-            let next_token_logits = pred.i((.., encoding.len() - 1, ..))?;
-            // println!("{next_token_logits}");
-            let next_token_id = next_token_logits.argmax(1)?;
-            let next_token = tokenizer.decode(&next_token_id.to_vec1()?, true).unwrap();
-            print!("{next_token}");
-            io::stdout().flush().expect("Failed to flush stdout");
-            query.push_str(&next_token);
-        }
-    }
-    if model.train {
-        let batch_size = 8;
-        let learning_rate = 0.001;
+    // let tokenizer = Tokenizer::from_pretrained("gpt2", None).unwrap();
+    // if !model.train {
+    //     let mut query = "Hello".to_string();
+    //     for _ in 0..100 {
+    //         let encoding: tokenizers::Encoding = tokenizer.encode(query.clone(), true).unwrap();
+    //         let encoding_ids = encoding.get_ids().to_vec();
+    //         let token_ids = Tensor::from_vec(encoding_ids, (1, encoding.len()), &device)?;
+    //         let pred = model.forward(&token_ids)?;
+    //         let next_token_logits = pred.i((.., encoding.len() - 1, ..))?;
+    //         // println!("{next_token_logits}");
+    //         let next_token_id = next_token_logits.argmax(1)?;
+    //         let next_token = tokenizer.decode(&next_token_id.to_vec1()?, true).unwrap();
+    //         print!("{next_token}");
+    //         io::stdout().flush().expect("Failed to flush stdout");
+    //         query.push_str(&next_token);
+    //     }
+    // }
+    // if model.train {
+    //     let batch_size = 8;
+    //     let learning_rate = 0.001;
 
-        // let mut lr_scheduler = LRScheduler::new(learning_rate, decay_rate); // initial_lr = 0.001, decay_rate = 0.99
-        let mut lr_scheduler = WarmupLRScheduler::new(0.001, 0.999, 10);
+    //     // let mut lr_scheduler = LRScheduler::new(learning_rate, decay_rate); // initial_lr = 0.001, decay_rate = 0.99
+    //     let mut lr_scheduler = WarmupLRScheduler::new(0.001, 0.999, 10);
 
-        let adamw_params = candle_nn::ParamsAdamW {
-            lr: learning_rate,
-            ..Default::default()
-        };
-        let mut optimizer = candle_nn::AdamW::new(vm.all_vars(), adamw_params)?;
-        let passage_path =
-            Path::new("/Users/petertran/Documents/projects/jinzo/on_writing_well.txt");
-        let mut passage_file = File::open(passage_path).unwrap();
-        let mut passage = String::new();
+    //     let adamw_params = candle_nn::ParamsAdamW {
+    //         lr: learning_rate,
+    //         ..Default::default()
+    //     };
+    //     let mut optimizer = candle_nn::AdamW::new(vm.all_vars(), adamw_params)?;
+    //     let passage_path =
+    //         Path::new("/Users/petertran/Documents/projects/jinzo/on_writing_well.txt");
+    //     let mut passage_file = File::open(passage_path).unwrap();
+    //     let mut passage = String::new();
 
-        passage_file.read_to_string(&mut passage).unwrap();
-        // println!("{passage}");
-        for _step in 0..100 {
-            let (inputs, labels) =
-                get_batch(&passage, batch_size, context_length, &tokenizer, &device)?;
+    //     passage_file.read_to_string(&mut passage).unwrap();
+    //     // println!("{passage}");
+    //     for _step in 0..100 {
+    //         let (inputs, labels) =
+    //             get_batch(&passage, batch_size, context_length, &tokenizer, &device)?;
 
-            // println!("Labels shape: {:?}", labels.shape());
-            // println!("Labels: {:?}", labels);
+    //         // println!("Labels shape: {:?}", labels.shape());
+    //         // println!("Labels: {:?}", labels);
 
-            // println!("{input} {label}");
-            // println!(
-            //     "Input Shape: {:?}, Label Shape: {:?}",
-            //     input.shape(),
-            //     label.shape()
-            // );
-            let logits = model.forward(&inputs)?;
-            let logits = logits.reshape((batch_size * context_length, vocab_size))?;
-            let labels = labels.reshape((batch_size * context_length,))?;
+    //         // println!("{input} {label}");
+    //         // println!(
+    //         //     "Input Shape: {:?}, Label Shape: {:?}",
+    //         //     input.shape(),
+    //         //     label.shape()
+    //         // );
+    //         let logits = model.forward(&inputs)?;
+    //         let logits = logits.reshape((batch_size * context_length, vocab_size))?;
+    //         let labels = labels.reshape((batch_size * context_length,))?;
 
-            let max_logits = logits.max_keepdim(1)?;
-            let logits = logits.broadcast_sub(&max_logits)?;
-            // println!("{logits}");
+    //         let max_logits = logits.max_keepdim(1)?;
+    //         let logits = logits.broadcast_sub(&max_logits)?;
+    //         // println!("{logits}");
 
-            let loss = loss::cross_entropy(&logits, &labels)?;
-            // let probs = candle_nn::ops::softmax(&logits, 1)?;
-            // // println!("Probs {probs}");
+    //         let loss = loss::cross_entropy(&logits, &labels)?;
+    //         // let probs = candle_nn::ops::softmax(&logits, 1)?;
+    //         // // println!("Probs {probs}");
 
-            // let loss = loss::nll(&probs, &labels)?;
-            // // println!("Calculated Loss! {loss}");
+    //         // let loss = loss::nll(&probs, &labels)?;
+    //         // // println!("Calculated Loss! {loss}");
 
-            let grads = loss.backward()?;
-            // // println!("Got grads {grads:?}");
+    //         let grads = loss.backward()?;
+    //         // // println!("Got grads {grads:?}");
 
-            lr_scheduler.apply(&mut optimizer);
-            optimizer.step(&grads).unwrap();
+    //         lr_scheduler.apply(&mut optimizer);
+    //         optimizer.step(&grads).unwrap();
 
-            println!(
-                "Loss: {:.5?}, LR: {:.6?}",
-                loss.to_scalar::<f32>()?,
-                optimizer.learning_rate()
-            );
-            vm.save(model_path).unwrap();
-        }
-    }
+    //         println!(
+    //             "Loss: {:.5?}, LR: {:.6?}",
+    //             loss.to_scalar::<f32>()?,
+    //             optimizer.learning_rate()
+    //         );
+    //         vm.save(model_path).unwrap();
+    //     }
+    // }
 
     // let model_path = Path::new("my_model");
 
