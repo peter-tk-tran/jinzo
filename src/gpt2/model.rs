@@ -1,12 +1,27 @@
 use core::f32;
 use core::ops::{Div, Sub};
 
-use candle_core::{IndexOp, Result, Shape, Tensor};
+use candle_core::{IndexOp, Result, Shape, Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{
     Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, LayerNormConfig, Linear,
     Module, VarBuilder,
 };
+
+pub fn conv1d_kernel1(out_channels: usize, in_channels: usize, vb: VarBuilder) -> Result<Conv1d> {
+    let cfg = Conv1dConfig::default();
+    let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
+    let ws = vb.get_with_hints((in_channels / cfg.groups, out_channels), "weight", init_ws)?;
+    let ws = ws.transpose(0, 1)?;
+    let ws = ws.unsqueeze(D::Minus1)?; // They had a custom
+    let bound = 1. / (in_channels as f64).sqrt();
+    let init_bs = candle_nn::Init::Uniform {
+        lo: -bound,
+        up: bound,
+    };
+    let bs = vb.get_with_hints(out_channels, "bias", init_bs)?;
+    Ok(Conv1d::new(ws, Some(bs), cfg))
+}
 
 pub struct Attention {
     num_heads: usize,
@@ -16,14 +31,8 @@ pub struct Attention {
 }
 impl Attention {
     fn new(num_heads: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let conv_config = Conv1dConfig {
-            padding: 0,
-            dilation: 0,
-            groups: 1,
-            stride: 1,
-        };
-        let c_attn = candle_nn::conv1d(embed_dim, embed_dim * 3, 1, conv_config, vb.pp("c_attn"))?;
-        let c_proj = candle_nn::conv1d(embed_dim, embed_dim, 1, conv_config, vb.pp("c_proj"))?;
+        let c_attn = conv1d_kernel1(embed_dim * 3, embed_dim, vb.pp("c_attn"))?;
+        let c_proj = conv1d_kernel1(embed_dim, embed_dim, vb.pp("c_proj"))?;
 
         let head_dim = embed_dim / num_heads;
         Ok(Self {
@@ -93,20 +102,8 @@ pub struct GPT2MLP {
 }
 impl GPT2MLP {
     pub fn new(intermediate_size: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let conv_config = Conv1dConfig {
-            padding: 0,
-            dilation: 0,
-            groups: 1,
-            stride: 1,
-        };
-        let c_fc = candle_nn::conv1d(embed_dim, intermediate_size, 1, conv_config, vb.pp("c_fc"))?;
-        let c_proj = candle_nn::conv1d(
-            intermediate_size,
-            embed_dim,
-            1,
-            conv_config,
-            vb.pp("c_proj"),
-        )?;
+        let c_fc = conv1d_kernel1(intermediate_size, embed_dim, vb.pp("c_fc"))?;
+        let c_proj = conv1d_kernel1(embed_dim, intermediate_size, vb.pp("c_proj"))?;
 
         let c_act = Activation::Gelu;
         let c_dropout = Dropout::new(0.2);
@@ -144,15 +141,15 @@ impl GPT2Block {
     fn new(embed_dim: usize, vb: VarBuilder) -> Result<Self> {
         let ln_c = LayerNormConfig {
             eps: 1e-05,
-            remove_mean: true,
-            affine: true,
+            remove_mean: false,
+            affine: false,
         };
-        let ln_1 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("layer_norm_1"))?;
+        let ln_1 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("ln_1"))?;
 
-        let num_heads = 4;
+        let num_heads = 12;
         let attn = Attention::new(num_heads, embed_dim, vb.pp("attn"))?;
 
-        let ln_2 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("layer_norm_2"))?;
+        let ln_2 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("ln_2"))?;
 
         let mlp = GPT2MLP::new(4 * embed_dim, embed_dim, vb.pp("mlp"))?;
 
@@ -213,20 +210,17 @@ impl GPT2Model {
 
         let ln_config = LayerNormConfig {
             eps: 1e-05,
-            remove_mean: true,
-            affine: true,
+            remove_mean: false,
+            affine: false,
         };
-        let ln_f = candle_nn::layer_norm(embed_dim, ln_config, vb.pp("layer_norm_f"))?;
+        let ln_f = candle_nn::layer_norm(embed_dim, ln_config, vb.pp("ln_f"))?;
 
         let mut h: Vec<GPT2Block> = Vec::new();
         for block_num in 0..12 {
-            h.push(GPT2Block::new(
-                embed_dim,
-                vb.pp(format!("block_{block_num}")),
-            )?);
+            h.push(GPT2Block::new(embed_dim, vb.pp(format!("h.{block_num}")))?);
         }
 
-        let lm_head = candle_nn::linear(embed_dim, vocab_size, vb.pp("lm_head"))?;
+        let lm_head = candle_nn::linear_no_bias(embed_dim, vocab_size, vb.pp("lm_head"))?;
         let train = true;
 
         Ok(GPT2Model {
