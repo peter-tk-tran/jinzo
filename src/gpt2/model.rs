@@ -23,14 +23,39 @@ pub fn conv1d_kernel1(out_channels: usize, in_channels: usize, vb: VarBuilder) -
     Ok(Conv1d::new(ws, Some(bs), cfg))
 }
 
+// #[derive(serde::Deserialize, Debug, Clone)]
+pub struct Config {
+    pub hidden_size: usize,
+    pub max_position_embeddings: usize,
+    pub vocab_size: usize,
+    pub embd_pdrop: f32,
+    pub num_hidden_layers: usize, // Number of blocks to use
+    pub layer_norm_epsilon: f64,
+    // self._attn_implementation = config._attn_implementation
+}
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            hidden_size: 768,
+            max_position_embeddings: 1024,
+            embd_pdrop: 0.2,
+            vocab_size: 50257,
+            num_hidden_layers: 12,
+            layer_norm_epsilon: 1e-5,
+        }
+    }
+}
+
 pub struct Attention {
     num_heads: usize,
     head_dim: usize,
     c_attn: Conv1d, // Concatenated attention
     c_proj: Conv1d, // Concatenated projection, instead of concating the results of each head, mix
+    train_mode: bool,
+    drop: Dropout,
 }
 impl Attention {
-    fn new(num_heads: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(num_heads: usize, embed_dim: usize, drop_p: f32, vb: VarBuilder) -> Result<Self> {
         let c_attn = conv1d_kernel1(embed_dim * 3, embed_dim, vb.pp("c_attn"))?;
         let c_proj = conv1d_kernel1(embed_dim, embed_dim, vb.pp("c_proj"))?;
 
@@ -40,13 +65,20 @@ impl Attention {
             head_dim,
             c_attn,
             c_proj,
+            train_mode: false,
+            drop: Dropout::new(drop_p),
         })
+    }
+    fn train(&mut self) {
+        self.train_mode = true;
+    }
+    fn eval(&mut self) {
+        self.train_mode = false;
     }
 }
 impl Module for Attention {
     fn forward(&self, hidden_state: &Tensor) -> Result<Tensor> {
         let (batch_size, num_tokens, embed_dim) = hidden_state.dims3()?;
-        // let hidden_state = hidden_state.transpose(1, 2)?;
         let mut kqv = self.c_attn.forward(&hidden_state.transpose(1, 2)?)?;
         kqv = kqv.transpose(1, 2)?; // Shape: B, T, embed_dim * 3
         kqv = kqv.reshape((batch_size, num_tokens, 3, embed_dim))?;
@@ -76,17 +108,16 @@ impl Module for Attention {
 
         // lhs 8, 12, 4, 64
         let mut weights = q.matmul(&k.transpose(2, 3)?)?;
+
         weights = weights.div((self.head_dim as f64).sqrt())?;
         weights = weights.broadcast_add(&causal_mask)?; // do not let previous tokens see the future
         weights = softmax_last_dim(&weights)?;
 
-        let dropout = Dropout::new(0.2);
-        weights = dropout.forward(&weights, true)?;
+        weights = self.drop.forward(&weights, self.train_mode)?;
 
         // println!("Weights {weights}"); // Thsese look good!
-        // TODO add dropout to the weights!
         let mut attn = weights.matmul(&v)?; // (B, heads, seq_length, head_features)
-        attn = attn.reshape(org_shape)?;
+        attn = attn.reshape(org_shape)?; // (B, T, embed_dim)
         attn = self.c_proj.forward(&attn.transpose(1, 2)?)?;
         attn = attn.transpose(1, 2)?;
         Ok(attn)
@@ -94,7 +125,7 @@ impl Module for Attention {
 }
 
 pub struct GPT2MLP {
-    pub train: bool,
+    train_mode: bool,
     c_fc: Conv1d,
     c_proj: Conv1d,
     c_act: Activation,
@@ -107,15 +138,21 @@ impl GPT2MLP {
 
         let c_act = Activation::Gelu;
         let c_dropout = Dropout::new(0.2);
-        let train = true;
+        let train = false;
 
         Ok(GPT2MLP {
-            train,
+            train_mode: train,
             c_fc,
             c_proj,
             c_act,
             c_dropout,
         })
+    }
+    fn train(&mut self) {
+        self.train_mode = true;
+    }
+    fn eval(&mut self) {
+        self.train_mode = false;
     }
 }
 impl Module for GPT2MLP {
@@ -125,7 +162,7 @@ impl Module for GPT2MLP {
         hidden_states = self.c_act.forward(&hidden_states)?;
         hidden_states = self.c_proj.forward(&hidden_states.transpose(1, 2)?)?;
         hidden_states = hidden_states.transpose(1, 2)?;
-        hidden_states = self.c_dropout.forward(&hidden_states, self.train)?;
+        hidden_states = self.c_dropout.forward(&hidden_states, self.train_mode)?;
         Ok(hidden_states)
     }
 }
@@ -136,18 +173,19 @@ pub struct GPT2Block {
     drop: Dropout,
     ln_2: LayerNorm,
     mlp: GPT2MLP,
+    train_mode: bool,
 }
 impl GPT2Block {
     fn new(embed_dim: usize, vb: VarBuilder) -> Result<Self> {
         let ln_c = LayerNormConfig {
             eps: 1e-05,
-            remove_mean: false,
+            remove_mean: true,
             affine: false,
         };
         let ln_1 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("ln_1"))?;
 
         let num_heads = 12;
-        let attn = Attention::new(num_heads, embed_dim, vb.pp("attn"))?;
+        let attn = Attention::new(num_heads, embed_dim, 0.2, vb.pp("attn"))?;
 
         let ln_2 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("ln_2"))?;
 
@@ -161,7 +199,18 @@ impl GPT2Block {
             drop,
             ln_2,
             mlp,
+            train_mode: false,
         })
+    }
+    fn train(&mut self) {
+        self.train_mode = true;
+        self.attn.train();
+        self.mlp.train();
+    }
+    fn eval(&mut self) {
+        self.train_mode = false;
+        self.attn.eval();
+        self.mlp.eval();
     }
 }
 
@@ -172,8 +221,8 @@ impl Module for GPT2Block {
         let mut hidden_states = self.ln_1.forward(hidden_states)?;
 
         let attn = self.attn.forward(&hidden_states)?;
-        let attn = self.drop.forward(&attn, true)?; // Assuming `self.dropout` is defined
 
+        let attn = self.drop.forward(&attn, self.train_mode)?; // Assuming `self.dropout` is defined
         hidden_states = residual.add(&attn)?;
 
         let residual = hidden_states.clone();
@@ -187,7 +236,7 @@ impl Module for GPT2Block {
 }
 
 pub struct GPT2Model {
-    pub train: bool,
+    pub train_mode: bool,
     pub wte: Embedding,
     pub wpe: Embedding,
     pub drop: Dropout,
@@ -197,34 +246,37 @@ pub struct GPT2Model {
 }
 
 impl GPT2Model {
-    pub fn new(
-        vocab_size: usize,
-        context_length: usize,
-        embed_dim: usize,
-        drop_p: f32,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        let wte = candle_nn::embedding(vocab_size, embed_dim, vb.pp("wte"))?;
-        let wpe = candle_nn::embedding(context_length, embed_dim, vb.pp("wpe"))?;
-        let drop = Dropout::new(drop_p);
+    pub fn new(vb: VarBuilder) -> Result<Self> {
+        let config = Config::default();
+        let wte = candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("wte"))?;
+        let wpe = candle_nn::embedding(
+            config.max_position_embeddings,
+            config.hidden_size,
+            vb.pp("wpe"),
+        )?;
+        let drop = Dropout::new(config.embd_pdrop);
 
         let ln_config = LayerNormConfig {
-            eps: 1e-05,
-            remove_mean: false,
+            eps: config.layer_norm_epsilon,
+            remove_mean: true,
             affine: false,
         };
-        let ln_f = candle_nn::layer_norm(embed_dim, ln_config, vb.pp("ln_f"))?;
+        let ln_f = candle_nn::layer_norm(config.hidden_size, ln_config, vb.pp("ln_f"))?;
 
         let mut h: Vec<GPT2Block> = Vec::new();
         for block_num in 0..12 {
-            h.push(GPT2Block::new(embed_dim, vb.pp(format!("h.{block_num}")))?);
+            h.push(GPT2Block::new(
+                config.hidden_size,
+                vb.pp(format!("h.{block_num}")),
+            )?);
         }
 
-        let lm_head = candle_nn::linear_no_bias(embed_dim, vocab_size, vb.pp("lm_head"))?;
-        let train = true;
+        let lm_head =
+            candle_nn::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
+        let train = false;
 
         Ok(GPT2Model {
-            train,
+            train_mode: train,
             wte,
             wpe,
             drop,
@@ -240,16 +292,26 @@ impl GPT2Model {
         let position_emb = self.wpe.forward(&positions)?;
         let mut hidden_states = input_emb.broadcast_add(&position_emb)?;
 
-        hidden_states = self.drop.forward(&hidden_states, self.train)?;
+        hidden_states = self.drop.forward(&hidden_states, self.train_mode)?;
         for block in self.h.iter() {
             hidden_states = block.forward(&hidden_states)?;
         }
-        // println!("FInished processing blocks");
         hidden_states = self.ln_f.forward(&hidden_states)?;
-
-        // println!("FInished ln f");
         let token_logits = self.lm_head.forward(&hidden_states)?;
-        // println!("{token_logits}");
         Ok(token_logits)
+    }
+
+    pub fn train(&mut self) {
+        self.train_mode = true;
+        for h in self.h.iter_mut() {
+            h.train();
+        }
+    }
+
+    pub fn eval(&mut self) {
+        self.train_mode = false;
+        for h in self.h.iter_mut() {
+            h.eval();
+        }
     }
 }

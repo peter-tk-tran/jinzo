@@ -70,10 +70,8 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&vm, candle_core::DType::F32, &device);
     let context_length = 1024;
     let vocab_size = 50257;
-    let embed_dim = 768;
-    let dropout_p = 0.2;
-    let mut model = GPT2Model::new(vocab_size, context_length, embed_dim, dropout_p, vb)?;
-    model.train = false;
+    let mut model = GPT2Model::new(vb)?;
+    model.eval();
 
     let model_tensors = candle_core::safetensors::load(model_path, &device)?;
     for (k, _v) in model_tensors.iter() {
@@ -86,8 +84,8 @@ fn main() -> Result<()> {
     }
 
     let tokenizer = Tokenizer::from_pretrained("gpt2", None).unwrap();
-    if !model.train {
-        let mut query = "Abraham Lincoln is".to_string();
+    if !model.train_mode {
+        let mut query = "Hello world".to_string();
         for _ in 0..100 {
             let encoding: tokenizers::Encoding = tokenizer.encode(query.clone(), true).unwrap();
             let encoding_ids = encoding.get_ids().to_vec();
@@ -102,7 +100,7 @@ fn main() -> Result<()> {
             query.push_str(&next_token);
         }
     }
-    if model.train {
+    if model.train_mode {
         let batch_size = 8;
         let learning_rate = 0.001;
 
