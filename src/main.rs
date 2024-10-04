@@ -13,14 +13,6 @@ use tokenizers::tokenizer::Tokenizer;
 
 use self::lr_scheduler::WarmupLRScheduler;
 
-fn count_params(vm: &VarMap) {
-    let mut num_params = 0;
-    for var in vm.all_vars() {
-        num_params += var.elem_count();
-    }
-    println!("Total Params: {num_params}");
-}
-
 fn load_weights(vm: &mut VarMap, model_path: &Path) {
     if let Err(e) = vm.load(model_path) {
         eprintln!("Failed to load the model: {:?}", e);
@@ -62,7 +54,7 @@ fn get_batch(
 
 fn main() -> Result<()> {
     // let model_path = Path::new("my_model");
-    let model_path = Path::new("/Users/petertran/Desktop/model.safetensors");
+    let model_path = Path::new("/Users/I747624/Documents/jinzo/model.safetensors");
     // let device = Device::Cpu;
     let device = Device::new_metal(0)?;
     let mut vm = VarMap::new();
@@ -73,31 +65,30 @@ fn main() -> Result<()> {
     let mut model = GPT2Model::new(vb)?;
     model.eval();
 
-    let model_tensors = candle_core::safetensors::load(model_path, &device)?;
-    for (k, _v) in model_tensors.iter() {
-        println!("Key {k}");
-        // println!("Value {v}");
-    }
-
     if model_path.exists() {
         load_weights(&mut vm, &model_path);
     }
 
     let tokenizer = Tokenizer::from_pretrained("gpt2", None).unwrap();
     if !model.train_mode {
-        let mut query = "Hello world".to_string();
+        let initial_text = "My name is Teven and I am";
+        print!("{}", initial_text);
+        io::stdout().flush().expect("Failed to flush stdout");
+
+        let encoding = tokenizer.encode(initial_text, true).unwrap();
+        let mut token_ids = encoding.get_ids().to_vec(); // Vec<u32>
+
         for _ in 0..100 {
-            let encoding: tokenizers::Encoding = tokenizer.encode(query.clone(), true).unwrap();
-            let encoding_ids = encoding.get_ids().to_vec();
-            let token_ids = Tensor::from_vec(encoding_ids, (1, encoding.len()), &device)?;
-            let pred = model.forward(&token_ids)?;
-            let next_token_logits = pred.i((.., encoding.len() - 1, ..))?;
-            // println!("{next_token_logits}");
-            let next_token_id = next_token_logits.argmax(1)?;
-            let next_token = tokenizer.decode(&next_token_id.to_vec1()?, true).unwrap();
-            print!("{next_token}");
+            let input_ids = Tensor::from_vec(token_ids.clone(), (1, token_ids.len()), &device)?;
+            let pred = model.forward(&input_ids)?;
+
+            let next_token_logits = pred.i((.., token_ids.len() - 1, ..))?.squeeze(0)?; // Shape: [vocab_size]
+            let next_token_id: u32 = next_token_logits.argmax(0)?.to_scalar().unwrap();
+            token_ids.push(next_token_id);
+
+            let next_token = tokenizer.decode(&[next_token_id], false).unwrap();
+            print!("{}", next_token);
             io::stdout().flush().expect("Failed to flush stdout");
-            query.push_str(&next_token);
         }
     }
     if model.train_mode {
@@ -112,44 +103,25 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         let mut optimizer = candle_nn::AdamW::new(vm.all_vars(), adamw_params)?;
-        let passage_path =
-            Path::new("/Users/petertran/Documents/projects/jinzo/on_writing_well.txt");
+        let passage_path = Path::new("/Users/I747624/Documents/jinzo/on_writing_well.txt");
         let mut passage_file = File::open(passage_path).unwrap();
         let mut passage = String::new();
 
         passage_file.read_to_string(&mut passage).unwrap();
-        // println!("{passage}");
         for _step in 0..100 {
             let (inputs, labels) =
                 get_batch(&passage, batch_size, context_length, &tokenizer, &device)?;
 
-            // println!("Labels shape: {:?}", labels.shape());
-            // println!("Labels: {:?}", labels);
-
-            // println!("{input} {label}");
-            // println!(
-            //     "Input Shape: {:?}, Label Shape: {:?}",
-            //     input.shape(),
-            //     label.shape()
-            // );
             let logits = model.forward(&inputs)?;
-            // println!("Raw {logits}");
             let logits = logits.reshape((batch_size * context_length, vocab_size))?;
-            // println!("After Reshape {logits}");
             let labels = labels.reshape((batch_size * context_length,))?;
 
             let max_logits = logits.max_keepdim(1)?;
             let logits = logits.broadcast_sub(&max_logits)?;
 
             let loss = loss::cross_entropy(&logits, &labels)?;
-            // let probs = candle_nn::ops::softmax(&logits, 1)?;
-            // // println!("Probs {probs}");
-
-            // let loss = loss::nll(&probs, &labels)?;
-            // // println!("Calculated Loss! {loss}");
 
             let grads = loss.backward()?;
-            // // println!("Got grads {grads:?}");
 
             lr_scheduler.apply(&mut optimizer);
             optimizer.step(&grads).unwrap();
@@ -162,17 +134,5 @@ fn main() -> Result<()> {
             vm.save(model_path).unwrap();
         }
     }
-    // let model_path = Path::new("my_model");
-
-    // println!("{pred}");
-    // let target_ids: Vec<u32> = vec![0, 1, 2];
-    // let target = Tensor::from_vec(target_ids, (3,), &device)?;
-    // let pred = pred.reshape((3, vocab_size))?;
-    // let loss = loss::cross_entropy(&pred, &target)?;
-    // println!("Loss {:?}", loss);
-    // let grad = loss.backward()?;
-    // println!("{:?}", grad);
-    // println!("{:?}", vm.data());
-    // println!("{:?}", vm.all_vars());
     Ok(())
 }

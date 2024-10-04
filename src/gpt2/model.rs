@@ -1,26 +1,41 @@
 use core::f32;
-use core::ops::{Div, Sub};
 
-use candle_core::{IndexOp, Result, Shape, Tensor, D};
+use candle_core::{IndexOp, Result, Shape, Tensor};
 use candle_nn::ops::softmax_last_dim;
-use candle_nn::{
-    Activation, Conv1d, Conv1dConfig, Dropout, Embedding, LayerNorm, LayerNormConfig, Linear,
-    Module, VarBuilder,
-};
+use candle_nn::{Activation, Dropout, Embedding, LayerNorm, LayerNormConfig, Module, VarBuilder};
 
-pub fn conv1d_kernel1(out_channels: usize, in_channels: usize, vb: VarBuilder) -> Result<Conv1d> {
-    let cfg = Conv1dConfig::default();
-    let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
-    let ws = vb.get_with_hints((in_channels / cfg.groups, out_channels), "weight", init_ws)?;
-    let ws = ws.transpose(0, 1)?;
-    let ws = ws.unsqueeze(D::Minus1)?; // They had a custom
-    let bound = 1. / (in_channels as f64).sqrt();
-    let init_bs = candle_nn::Init::Uniform {
-        lo: -bound,
-        up: bound,
-    };
-    let bs = vb.get_with_hints(out_channels, "bias", init_bs)?;
-    Ok(Conv1d::new(ws, Some(bs), cfg))
+struct GPT2Conv1D {
+    num_output_features: usize,
+    weight: Tensor,
+    bias: Tensor,
+}
+impl GPT2Conv1D {
+    fn new(nf: usize, nx: usize, vb: VarBuilder) -> Result<Self> {
+        let init_weight = candle_nn::init::DEFAULT_KAIMING_NORMAL;
+        let weight = vb.get_with_hints((nx, nf), "weight", init_weight)?;
+        let init_bias = candle_nn::init::Init::Const(0.0);
+        let bias = vb.get_with_hints((nf,), "bias", init_bias)?;
+        Ok(GPT2Conv1D {
+            weight,
+            bias,
+            num_output_features: nf,
+        })
+    }
+}
+
+impl Module for GPT2Conv1D {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (batch_size, num_tokens, embed_dim) = x.dims3()?;
+        let output_shape = Shape::from_dims(&[batch_size, num_tokens, self.num_output_features]);
+
+        let mut output = x
+            .reshape(&[batch_size * num_tokens, embed_dim])?
+            .matmul(&self.weight)?;
+
+        output = output.broadcast_add(&self.bias)?;
+        output = output.reshape(output_shape)?;
+        Ok(output)
+    }
 }
 
 // #[derive(serde::Deserialize, Debug, Clone)]
@@ -49,17 +64,20 @@ impl Default for Config {
 pub struct Attention {
     num_heads: usize,
     head_dim: usize,
-    c_attn: Conv1d, // Concatenated attention
-    c_proj: Conv1d, // Concatenated projection, instead of concating the results of each head, mix
+    c_attn: GPT2Conv1D, // Concatenated attention
+    c_proj: GPT2Conv1D, // Concatenated projection, instead of concating the results of each head, mix
     train_mode: bool,
     drop: Dropout,
+    bias: Tensor,
 }
 impl Attention {
     fn new(num_heads: usize, embed_dim: usize, drop_p: f32, vb: VarBuilder) -> Result<Self> {
-        let c_attn = conv1d_kernel1(embed_dim * 3, embed_dim, vb.pp("c_attn"))?;
-        let c_proj = conv1d_kernel1(embed_dim, embed_dim, vb.pp("c_proj"))?;
+        let c_attn = GPT2Conv1D::new(embed_dim * 3, embed_dim, vb.pp("c_attn"))?;
+        let c_proj = GPT2Conv1D::new(embed_dim, embed_dim, vb.pp("c_proj"))?;
 
         let head_dim = embed_dim / num_heads;
+        let bias = vb.get((1, 1, 1024, 1024), "bias")?;
+
         Ok(Self {
             num_heads,
             head_dim,
@@ -67,6 +85,7 @@ impl Attention {
             c_proj,
             train_mode: false,
             drop: Dropout::new(drop_p),
+            bias,
         })
     }
     fn train(&mut self) {
@@ -79,13 +98,13 @@ impl Attention {
 impl Module for Attention {
     fn forward(&self, hidden_state: &Tensor) -> Result<Tensor> {
         let (batch_size, num_tokens, embed_dim) = hidden_state.dims3()?;
-        let mut kqv = self.c_attn.forward(&hidden_state.transpose(1, 2)?)?;
-        kqv = kqv.transpose(1, 2)?; // Shape: B, T, embed_dim * 3
-        kqv = kqv.reshape((batch_size, num_tokens, 3, embed_dim))?;
+        let mut qkv = self.c_attn.forward(&hidden_state)?;
 
-        let mut q = kqv.i((.., .., 0, ..))?; // batch_size, num_tokens, embed_dim
-        let mut k = kqv.i((.., .., 1, ..))?;
-        let mut v = kqv.i((.., .., 2, ..))?;
+        qkv = qkv.reshape((batch_size, num_tokens, 3, embed_dim))?;
+
+        let mut q = qkv.i((.., .., 0, ..))?; // batch_size, num_tokens, embed_dim
+        let mut k = qkv.i((.., .., 1, ..))?;
+        let mut v = qkv.i((.., .., 2, ..))?;
 
         let org_shape = q.shape().clone();
         let new_shape = Shape::from_dims(&[batch_size, num_tokens, self.num_heads, self.head_dim]);
@@ -98,43 +117,44 @@ impl Module for Attention {
         k = k.permute((0, 2, 1, 3))?.contiguous()?;
         v = v.permute((0, 2, 1, 3))?.contiguous()?;
 
-        let device = kqv.device();
+        // Query Key and Value are perfect, don't need to check here..
+        // println!("q {}", q.mean_all()?);
+        // println!("k {}", k.mean_all()?);
+        // println!("v {}", v.mean_all()?);
 
-        // Create the lower triangular mask using `tril2`
-        let mut causal_mask = Tensor::tril2(num_tokens, candle_core::DType::F32, device)?; // Shape: (seq_len, seq_len)
-        let mask_value = 1e9;
-        causal_mask = (causal_mask.sub(1.0)? * mask_value)?; // Converts ones to zeros and zeros to `-1e9`
-                                                             // println!("Causal Mask is {causal_mask}");
+        // Creating causal_mask
+        let mut causal_mask = self.bias.i((.., .., 0..num_tokens, 0..num_tokens))?;
+        causal_mask = (causal_mask.neg()? + 1.0)?;
+        causal_mask = (causal_mask * std::f32::MIN as f64)?.to_dtype(candle_core::DType::F32)?; // Be wary of numerical overflow here...TODO
 
-        // lhs 8, 12, 4, 64
-        let mut weights = q.matmul(&k.transpose(2, 3)?)?;
+        // LHS: (B, H, T, head_features),
+        let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?;
+        let scale_factor = 1.0 / (self.head_dim as f64).sqrt(); // Hand checked this is good
+        attn_weights = (attn_weights * scale_factor)?;
 
-        weights = weights.div((self.head_dim as f64).sqrt())?;
-        weights = weights.broadcast_add(&causal_mask)?; // do not let previous tokens see the future
-        weights = softmax_last_dim(&weights)?;
+        attn_weights = attn_weights.broadcast_add(&causal_mask)?;
+        attn_weights = softmax_last_dim(&attn_weights)?;
+        attn_weights = self.drop.forward(&attn_weights, self.train_mode)?;
 
-        weights = self.drop.forward(&weights, self.train_mode)?;
-
-        // println!("Weights {weights}"); // Thsese look good!
-        let mut attn = weights.matmul(&v)?; // (B, heads, seq_length, head_features)
-        attn = attn.reshape(org_shape)?; // (B, T, embed_dim)
-        attn = self.c_proj.forward(&attn.transpose(1, 2)?)?;
-        attn = attn.transpose(1, 2)?;
+        let mut attn = attn_weights.matmul(&v)?; // (batch, heads, seq_length, head_features)
+        attn = attn.transpose(1, 2)?.contiguous()?;
+        attn = attn.reshape(org_shape)?; // (batch, seq_length, embed_dim)
+        attn = self.c_proj.forward(&attn)?;
         Ok(attn)
     }
 }
 
 pub struct GPT2MLP {
     train_mode: bool,
-    c_fc: Conv1d,
-    c_proj: Conv1d,
+    c_fc: GPT2Conv1D,
+    c_proj: GPT2Conv1D,
     c_act: Activation,
     c_dropout: Dropout,
 }
 impl GPT2MLP {
     pub fn new(intermediate_size: usize, embed_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let c_fc = conv1d_kernel1(intermediate_size, embed_dim, vb.pp("c_fc"))?;
-        let c_proj = conv1d_kernel1(embed_dim, intermediate_size, vb.pp("c_proj"))?;
+        let c_fc = GPT2Conv1D::new(intermediate_size, embed_dim, vb.pp("c_fc"))?;
+        let c_proj = GPT2Conv1D::new(embed_dim, intermediate_size, vb.pp("c_proj"))?;
 
         let c_act = Activation::Gelu;
         let c_dropout = Dropout::new(0.2);
@@ -157,11 +177,9 @@ impl GPT2MLP {
 }
 impl Module for GPT2MLP {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        let mut hidden_states = self.c_fc.forward(&hidden_states.transpose(1, 2)?)?;
-        hidden_states = hidden_states.transpose(1, 2)?;
+        let mut hidden_states = self.c_fc.forward(&hidden_states)?;
         hidden_states = self.c_act.forward(&hidden_states)?;
-        hidden_states = self.c_proj.forward(&hidden_states.transpose(1, 2)?)?;
-        hidden_states = hidden_states.transpose(1, 2)?;
+        hidden_states = self.c_proj.forward(&hidden_states)?;
         hidden_states = self.c_dropout.forward(&hidden_states, self.train_mode)?;
         Ok(hidden_states)
     }
@@ -180,7 +198,7 @@ impl GPT2Block {
         let ln_c = LayerNormConfig {
             eps: 1e-05,
             remove_mean: true,
-            affine: false,
+            affine: true,
         };
         let ln_1 = candle_nn::layer_norm(embed_dim, ln_c, vb.pp("ln_1"))?;
 
@@ -219,10 +237,10 @@ impl Module for GPT2Block {
         let residual = hidden_states.clone();
 
         let mut hidden_states = self.ln_1.forward(hidden_states)?;
-
         let attn = self.attn.forward(&hidden_states)?;
+        // println!("hidden {}", hidden_states.mean_all()?);
 
-        let attn = self.drop.forward(&attn, self.train_mode)?; // Assuming `self.dropout` is defined
+        let attn = self.drop.forward(&attn, self.train_mode)?;
         hidden_states = residual.add(&attn)?;
 
         let residual = hidden_states.clone();
@@ -242,7 +260,6 @@ pub struct GPT2Model {
     pub drop: Dropout,
     pub h: Vec<GPT2Block>,
     pub ln_f: LayerNorm,
-    pub lm_head: Linear,
 }
 
 impl GPT2Model {
@@ -259,7 +276,7 @@ impl GPT2Model {
         let ln_config = LayerNormConfig {
             eps: config.layer_norm_epsilon,
             remove_mean: true,
-            affine: false,
+            affine: true,
         };
         let ln_f = candle_nn::layer_norm(config.hidden_size, ln_config, vb.pp("ln_f"))?;
 
@@ -271,8 +288,6 @@ impl GPT2Model {
             )?);
         }
 
-        let lm_head =
-            candle_nn::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
         let train = false;
 
         Ok(GPT2Model {
@@ -282,7 +297,6 @@ impl GPT2Model {
             drop,
             h,
             ln_f,
-            lm_head,
         })
     }
     pub fn forward(&self, token_ids: &Tensor) -> Result<Tensor> {
@@ -297,7 +311,10 @@ impl GPT2Model {
             hidden_states = block.forward(&hidden_states)?;
         }
         hidden_states = self.ln_f.forward(&hidden_states)?;
-        let token_logits = self.lm_head.forward(&hidden_states)?;
+
+        let token_logits =
+            hidden_states.broadcast_matmul(&self.wte.embeddings().transpose(0, 1)?)?;
+
         Ok(token_logits)
     }
 
