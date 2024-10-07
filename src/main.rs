@@ -1,6 +1,7 @@
 pub mod gpt2;
 pub mod lr_scheduler;
-use rand::Rng;
+use self::lr_scheduler::WarmupLRScheduler;
+use gpt2::model::GPT2Model;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -8,10 +9,22 @@ use std::path::Path;
 
 use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
-use gpt2::model::GPT2Model;
+use clap::Parser;
+use rand::Rng;
 use tokenizers::tokenizer::Tokenizer;
 
-use self::lr_scheduler::WarmupLRScheduler;
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    model_path: String,
+
+    #[arg(short, long)]
+    prompt: String,
+
+    #[arg(short, long, default_value = "cpu")]
+    device: String,
+}
 
 fn load_weights(vm: &mut VarMap, model_path: &Path) {
     if let Err(e) = vm.load(model_path) {
@@ -53,12 +66,18 @@ fn get_batch(
 }
 
 fn main() -> Result<()> {
-    // let model_path = Path::new("my_model");
-    let model_path = Path::new("/Users/I747624/Documents/jinzo/model.safetensors");
-    // let device = Device::Cpu;
-    let device = Device::new_metal(0)?;
-    let mut vm = VarMap::new();
+    let args = Args::parse();
+    let model_path = Path::new(&args.model_path);
+    let device = match args.device.to_lowercase().as_str() {
+        "cpu" => Device::Cpu,
+        "metal" => Device::new_metal(0)?, // Assuming you want to use the default Metal device 0
+        _ => {
+            eprintln!("Invalid device specified. Defaulting to CPU.");
+            Device::Cpu
+        }
+    };
 
+    let mut vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, candle_core::DType::F32, &device);
     let context_length = 1024;
     let vocab_size = 50257;
@@ -71,11 +90,11 @@ fn main() -> Result<()> {
 
     let tokenizer = Tokenizer::from_pretrained("gpt2", None).unwrap();
     if !model.train_mode {
-        let initial_text = "My name is Teven and I am";
-        print!("{}", initial_text);
+        let prompt = args.prompt;
+        print!("{}", prompt);
         io::stdout().flush().expect("Failed to flush stdout");
 
-        let encoding = tokenizer.encode(initial_text, true).unwrap();
+        let encoding = tokenizer.encode(prompt, true).unwrap();
         let mut token_ids = encoding.get_ids().to_vec(); // Vec<u32>
 
         for _ in 0..100 {
